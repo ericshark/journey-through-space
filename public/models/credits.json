@@ -1,0 +1,6 @@
+{
+  "file": "voyager.glb",
+  "credit": "NASA Visualization Technology Applications and Development (VTAD)",
+  "source": "https://science.nasa.gov/resource/voyager-3d-model/",
+  "modifications": "Original model bundled locally. The renderer centers, rotates, and uniformly scales the spacecraft for inspection."
+}

@@ -11,18 +11,15 @@ import {
   Matrix4,
   Mesh,
   MeshBasicMaterial,
-  NoColorSpace,
   PerspectiveCamera,
   PlaneGeometry,
   Points,
   PointsMaterial,
   Quaternion,
-  RedFormat,
   RingGeometry,
   Scene,
   ShaderMaterial,
   SphereGeometry,
-  SRGBColorSpace,
   Texture,
   TextureLoader,
   Vector2,
@@ -33,12 +30,18 @@ import {
 } from 'three';
 import { vertexShader, fragmentShader } from './blackhole.glsl';
 import { smooth } from './science';
-import { buildVoyager } from './voyager';
+import { buildVoyager, loadVoyager, disposeVoyager } from './voyager';
 import { SceneryLayers } from './scenery-layers';
 import { sceneryAt } from './scenery';
 import { CHECKPOINTS } from './journey';
 import { SPACING, type FlightState } from './flight';
-import { ASSETS, HERO, residentAssets, residentStops } from './assets';
+import {
+  ASSETS,
+  HERO,
+  configureTexture,
+  residentAssets,
+  residentStops,
+} from './assets';
 import {
   RING_INNER,
   RING_OUTER,
@@ -54,7 +57,7 @@ import {
 } from './planet-materials';
 import { DEFAULT_LIGHT, lookFor, type WorldLook } from './worlds';
 import { BASE_FOV, exposureFor, warpAt, type GlareSource } from './warp';
-import { Starfield } from './starfield';
+import { Starfield, skyRotation } from './starfield';
 import { Post, forcedTier, selectTier, tierSettings, type Tier } from './post';
 
 const assets = new Map<string, Texture>();
@@ -75,6 +78,7 @@ interface Node {
   look?: WorldLook;
   light: Vector3;
   heroes: HeroSlot[];
+  probe?: Group;
 }
 const FALLBACK_LOOK: WorldLook = {
   surface: 'rock',
@@ -126,9 +130,8 @@ export class JourneyRenderer {
       uCamPos: { value: new Vector3() },
       uCamBasis: { value: new Matrix3() },
       uTanHalfFov: { value: 0.36 },
-      uLensPos: { value: new Vector3() },
-      uLensMass: { value: 0 },
-      uStepScale: { value: 1 },
+      uSky: { value: null as Texture | null },
+      uGalFromLens: { value: new Matrix3() },
       uOpacity: { value: 0 },
       uDarkness: { value: 0 },
       uOffset: { value: new Vector2() },
@@ -152,6 +155,12 @@ export class JourneyRenderer {
   private heroes = new Map<string, { texture?: Texture }>();
   private skyHero?: Texture;
   private skyHeroLoading = false;
+  private voyagerLoading = false;
+  private voyager?: Group;
+  private disposed = false;
+  private horizonWidth = 0;
+  private horizonHeight = 0;
+  private horizonDrawKey = '';
   /** Odometer of route position travelled, driving near-field parallax. */
   private odometer = 0;
   private lastPosition: number | null = null;
@@ -175,6 +184,8 @@ export class JourneyRenderer {
     heroes: [] as string[],
     bank: 0,
     target: { x: 0, y: 0, visible: false },
+    horizonSize: [0, 0],
+    voyagerModel: false,
   };
   private scale = 0.85;
   private last = 0;
@@ -204,6 +215,7 @@ export class JourneyRenderer {
     if (this.fallbackPinned) return;
     this.contextLost = false;
     this.drawnKey = '';
+    this.horizonDrawKey = '';
     this.diagnostics.contextLost = false;
     this.onContextRestored?.();
   };
@@ -333,9 +345,11 @@ export class JourneyRenderer {
       name,
       setTimeout(() => applyFallback(true), LOAD_TIMEOUT_MS),
     );
-    texture.colorSpace = spec.linear ? NoColorSpace : SRGBColorSpace;
-    if (spec.single) texture.format = RedFormat;
-    texture.anisotropy = this.renderer.capabilities.getMaxAnisotropy();
+    configureTexture(
+      texture,
+      name,
+      this.renderer.capabilities.getMaxAnisotropy(),
+    );
     assets.set(name, texture);
     return texture;
   }
@@ -344,13 +358,14 @@ export class JourneyRenderer {
    * already showing, so a slow or failed hero never delays or degrades a stop.
    */
   private loadHero(name: string, onLoad: (texture: Texture) => void) {
-    const spec = ASSETS[name];
     this.loader.load(
       `/textures/${HERO[name]}`,
       (texture) => {
-        texture.colorSpace = spec.linear ? NoColorSpace : SRGBColorSpace;
-        if (spec.single) texture.format = RedFormat;
-        texture.anisotropy = this.renderer.capabilities.getMaxAnisotropy();
+        configureTexture(
+          texture,
+          name,
+          this.renderer.capabilities.getMaxAnisotropy(),
+        );
         texture.needsUpdate = true;
         onLoad(texture);
       },
@@ -474,6 +489,8 @@ export class JourneyRenderer {
     return this.scale;
   }
   private clear() {
+    // The loaded spacecraft is reused when its stop becomes resident again.
+    if (this.voyager?.parent === this.object) this.voyager.removeFromParent();
     this.object.traverse((child) => {
       if (child instanceof Mesh || child instanceof Points) {
         child.geometry.dispose();
@@ -502,6 +519,7 @@ export class JourneyRenderer {
       lookFor(p.id) ??
       (p.kind === 'planet' || p.kind === 'star' ? FALLBACK_LOOK : undefined);
     const heroes: HeroSlot[] = [];
+    let probe: Group | undefined;
     /** Bind a material uniform to a base map, remembering 8K upgrades. */
     const bind = (m: Material, uniform: string, name: string) => {
       const u = (m as ShaderMaterial).uniforms[uniform];
@@ -598,8 +616,30 @@ export class JourneyRenderer {
       }
     } else if (p.kind === 'probe') {
       // Dish faces the approaching camera, turned so the booms read in silhouette.
-      this.object.rotation.set(0.32, Math.PI + 1.15, 0.1);
-      this.object.add(buildVoyager());
+      this.object.rotation.set(0.22, Math.PI + 0.7, 0.12);
+      probe = this.voyager ?? buildVoyager();
+      this.object.add(probe);
+      if (!this.voyager && !this.voyagerLoading) {
+        this.voyagerLoading = true;
+        void loadVoyager()
+          .then((model) => {
+            if (this.disposed) {
+              disposeVoyager(model);
+              return;
+            }
+            this.voyager = model;
+            const node = this.nodes.get(index);
+            if (!node?.probe) return;
+            node.probe.removeFromParent();
+            disposeVoyager(node.probe);
+            node.group.add(model);
+            node.probe = model;
+            this.drawnKey = '';
+          })
+          .catch(() => {
+            this.voyagerLoading = false;
+          });
+      }
     } else if (p.kind === 'field') {
       const points = [],
         n = p.id === 'oort' ? 420 : 650;
@@ -676,6 +716,7 @@ export class JourneyRenderer {
       look,
       light: new Vector3(...(look?.light ?? DEFAULT_LIGHT)),
       heroes,
+      probe,
     });
   }
   resize() {
@@ -685,12 +726,6 @@ export class JourneyRenderer {
       Math.min(devicePixelRatio, this.tierSettings.dprCap) * this.scale,
     );
     this.renderer.setSize(width, height, false);
-    // Bound ray integration cost independently of the crisp scene and HTML instruments.
-    const horizonWidth = Math.round(Math.min(width, 640) * this.scale);
-    this.horizonTarget.setSize(
-      horizonWidth,
-      Math.round((horizonWidth * height) / width),
-    );
     this.camera.aspect = width / height;
     this.camera.updateProjectionMatrix();
     this.post.resize();
@@ -781,7 +816,15 @@ export class JourneyRenderer {
     const interior = s.phase === 'interior';
     const descent = s.phase === 'blackhole' || interior;
     const hu = this.horizonMaterial.uniforms;
-    hu.uResolution.value.set(innerWidth, innerHeight);
+    if (handoff > 0) {
+      hu.uSky.value = this.skyHero ?? assets.get('milkyway') ?? null;
+      hu.uGalFromLens.value.setFromMatrix4(
+        new Matrix4()
+          .makeRotationFromQuaternion(skyRotation(s.position))
+          .transpose()
+          .multiply(this.scratch.makeRotationX(-0.25)),
+      );
+    }
     hu.uTime.value = reduced ? 0 : time;
     hu.uOpacity.value = handoff;
     hu.uDarkness.value = descent ? 1 - smooth((s.bhRadius - 1) / 0.5) : 0;
@@ -942,6 +985,9 @@ export class JourneyRenderer {
       nodeIds: Object.fromEntries(
         [...this.nodes].map(([i, n]) => [i, n.group.uuid]),
       ),
+      horizonSize:
+        handoff > 0 ? [this.horizonWidth, this.horizonHeight] : [0, 0],
+      voyagerModel: Boolean(this.voyager?.parent),
       target: {
         x: (target.x + 1) / 2,
         y: (1 - target.y) / 2,
@@ -988,11 +1034,42 @@ export class JourneyRenderer {
       return;
     this.drawnKey = drawKey;
     if (handoff > 0) {
-      this.renderer.setRenderTarget(this.horizonTarget);
-      this.renderer.setClearColor('#000000', 0);
-      this.renderer.render(this.horizonScene, this.horizonCamera);
-      this.renderer.setRenderTarget(null);
-      this.renderer.setClearColor('#000000', 1);
+      const buffer = this.renderer.getDrawingBufferSize(new Vector2());
+      // Reduce only ray integration during motion. High-tier observation resolves
+      // at the drawing buffer's native resolution, including on 4K displays.
+      const moving = s.playback === 'flying' || s.dragging || descent;
+      const rayScale =
+        this.post.tier === 'high'
+          ? moving && !reduced
+            ? 0.6
+            : 1
+          : this.post.tier === 'medium'
+            ? moving
+              ? 0.5
+              : 0.8
+            : moving
+              ? 0.45
+              : 0.6;
+      const budgetScale = Math.sqrt((3840 * 2160) / (buffer.x * buffer.y));
+      const scale = Math.min(rayScale, budgetScale);
+      this.horizonWidth = Math.max(1, Math.round(buffer.x * scale));
+      this.horizonHeight = Math.max(1, Math.round(buffer.y * scale));
+      this.diagnostics.horizonSize = [this.horizonWidth, this.horizonHeight];
+      this.horizonTarget.setSize(this.horizonWidth, this.horizonHeight);
+      hu.uResolution.value.set(this.horizonWidth, this.horizonHeight);
+      const staticView =
+        (reduced && s.playback === 'observing') || hu.uDarkness.value >= 1;
+      const horizonKey = staticView
+        ? `${drawKey}:${this.horizonWidth}:${this.horizonHeight}:${hu.uSky.value?.version}:${hu.uSky.value?.uuid}`
+        : '';
+      if (!horizonKey || horizonKey !== this.horizonDrawKey) {
+        this.horizonDrawKey = horizonKey;
+        this.renderer.setRenderTarget(this.horizonTarget);
+        this.renderer.setClearColor('#000000', 0);
+        this.renderer.render(this.horizonScene, this.horizonCamera);
+        this.renderer.setRenderTarget(null);
+        this.renderer.setClearColor('#000000', 1);
+      }
     }
     const composed = this.post.render({
       exposure: exposure.scene,
@@ -1000,11 +1077,12 @@ export class JourneyRenderer {
       bend: warp.bend * alignment,
       stretch: warp.stretch * alignment,
       overlay: handoff > 0,
+      opaqueOverlay: handoff === 1 ? this.horizonTarget : undefined,
     });
     if (!composed) {
-      this.renderer.render(this.scene, this.camera);
+      if (handoff < 1) this.renderer.render(this.scene, this.camera);
       if (handoff > 0) {
-        this.renderer.autoClear = false;
+        this.renderer.autoClear = handoff === 1;
         this.renderer.render(this.horizonComposite, this.horizonCamera);
         this.renderer.autoClear = true;
       }
@@ -1026,6 +1104,7 @@ export class JourneyRenderer {
     this.drawnKey = '';
   }
   dispose() {
+    this.disposed = true;
     this.canvas.removeEventListener('webglcontextlost', this.handleContextLost);
     this.canvas.removeEventListener(
       'webglcontextrestored',
@@ -1046,6 +1125,7 @@ export class JourneyRenderer {
       (n.glint.material as ShaderMaterial).dispose();
     }
     this.nodes.clear();
+    if (this.voyager) disposeVoyager(this.voyager);
     this.scenery.dispose();
     this.starfield.dispose();
     this.post.dispose();

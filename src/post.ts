@@ -88,17 +88,15 @@ void main(){
   // Space bends softly towards the frame edges at speed; the heading stays true.
   vec2 uv=uCenter+d*(1.-uBend*.16*r*r)/a;
   vec3 col;
-  float w=uStretch*smoothstep(.15,.85,r)*.03;
+  float w=uStretch*smoothstep(.20,.95,r)*.018;
+  // A short exposure smear at the periphery. The stronger individual trails
+  // come from projected star motion, so the destination retains a crisp edge.
   if(w>.0005){
-    vec2 toward=(uCenter-uv);
-    vec3 acc=vec3(0.);float tot=0.;
-    for(int i=0;i<8;i++){
-      float t=float(i)/7.,k=1.-t*.6;
-      vec2 o=toward*w*t;
-      acc+=vec3(texture2D(tDiffuse,uv+o*1.18).r,texture2D(tDiffuse,uv+o).g,texture2D(tDiffuse,uv+o*.82).b)*k;
-      tot+=k;
-    }
-    col=acc/tot;
+    vec2 smear=(uCenter-uv)*w;
+    col=texture2D(tDiffuse,uv).rgb*.5
+      +texture2D(tDiffuse,uv+smear*.32).rgb*.27
+      +texture2D(tDiffuse,uv+smear*.65).rgb*.15
+      +texture2D(tDiffuse,uv+smear).rgb*.08;
   }else col=texture2D(tDiffuse,uv).rgb;
   col=srgb(clamp(neutral(col*uExposure),0.,1.));
   float n=fract(sin(dot(gl_FragCoord.xy+uSeed,vec2(12.9898,78.233)))*43758.5453);
@@ -113,6 +111,7 @@ export interface PostFrame {
   bend: number;
   stretch: number;
   overlay: boolean;
+  opaqueOverlay?: WebGLRenderTarget;
 }
 
 export class Post {
@@ -193,8 +192,21 @@ export class Post {
     u.uBend.value = f.bend;
     u.uStretch.value = f.stretch;
     u.uSeed.value = this.frame = (this.frame + 1) % 997;
-    this.overlayPass!.enabled = f.overlay;
-    this.composer.render();
+    if (f.opaqueOverlay) {
+      // The opaque lens covers the scene, and its tone-mapped pixels are below
+      // the bloom threshold. Present it without allocating the MSAA buffers.
+      this.output.renderToScreen = true;
+      this.output.render(
+        this.renderer,
+        f.opaqueOverlay,
+        f.opaqueOverlay,
+        0,
+        false,
+      );
+    } else {
+      this.overlayPass!.enabled = f.overlay;
+      this.composer.render();
+    }
     return true;
   }
   private disposeChain() {

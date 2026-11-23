@@ -45,19 +45,28 @@ vec3 blackbody(float k){
   return pow(vec3(r,g,b),vec3(2.2));
 }`;
 /** Capsule fragment shared by stars and streaks: bright head, fading tail. */
-const CAPSULE_FRAG = `varying vec3 vC;varying vec2 vQ;varying float vLen;varying float vW;
+const CAPSULE_FRAG = `
+varying vec3 vC;
+varying vec2 vQ;
+varying float vLen, vW, vHalo;
 void main(){
   float x=clamp(vQ.x,0.,vLen);
-  vec2 d=vec2(vQ.x-x,vQ.y)/vW;
-  float a=exp(-dot(d,d)*2.6);
-  float along=vLen>.5?mix(.18,1.,pow(x/vLen,1.6)):1.;
-  gl_FragColor=vec4(vC*a*along,1.);
+  float progress=x/max(vLen,0.001);
+  float trail=smoothstep(0.,3.*vW,vLen);
+  float taper=mix(1.,mix(.24,1.,sqrt(progress)),trail);
+  vec2 delta=vec2(vQ.x-x,vQ.y)/(vW*taper);
+  float radius2=dot(delta,delta);
+  float edge=1.-smoothstep(.55,1.,radius2);
+  float core=exp(-radius2*5.5);
+  float halo=vHalo*exp(-radius2*1.8)*.24;
+  float along=mix(1.,mix(.025,1.,pow(progress,1.5)),trail);
+  gl_FragColor=vec4(vC*(core+halo)*edge*along,1.);
   ${OUTPUT}
 }`;
 /** Screen-space quad between a projected tail and head, `width` px half-width. */
 const CAPSULE_QUAD = `
 attribute vec2 aCorner;uniform vec2 uViewport;
-varying vec2 vQ;varying float vLen;varying float vW;
+varying vec2 vQ;varying float vLen,vW,vHalo;
 vec4 capsule(vec4 ch,vec4 ct,float width,float depth){
   vec2 sh=ch.xy/ch.w*.5*uViewport,st=ct.xy/ct.w*.5*uViewport;
   vec2 axis=sh-st;float len=length(axis);
@@ -192,9 +201,10 @@ void main(){
   if(vt.z>-.05)vt=vh;
   vec4 ch=projectionMatrix*vh,ct=projectionMatrix*vt;
   float width=clamp(uSize*uFocal/max(1.,-vh.z),.6,uMaxWidth);
-  float len=length(ch.xy/ch.w-ct.xy/ct.w)*.5*uViewport.x;
+  float len=length((ch.xy/ch.w-ct.xy/ct.w)*.5*uViewport);
   // Spread a speck's light along its streak so long streaks don't flare.
   vC=aColor*fade*uOpacity*mix(1.,(2.*width)/(2.*width+len),.6);
+  vHalo=0.;
   gl_Position=capsule(ch,ct,width,ch.z/ch.w);
 }`,
       fragmentShader: CAPSULE_FRAG,
@@ -251,7 +261,7 @@ void main(){
   vec3 g=uGalFromWorld*s;
   vec2 uv=vec2(.5-atan(g.y,g.x)/6.2831853,.5+asin(clamp(g.z,-1.,1.))/3.14159265);
   vec3 c=uHasMap>.5?texture2D(map,uv).rgb:vec3(.004);
-  float D=inversesqrt(1.-uBeta*uBeta)*(1.+uBeta*co);
+  float D=inversesqrt(1.-uBeta*uBeta)*(1.+uBeta*cs);
   c*=min(pow(D,1.5),2.2);
   c=mix(c,c*vec3(.7,.86,1.3),clamp((D-1.)*.45,0.,1.));
   c=mix(c,c*vec3(1.35,.62,.4),clamp((1.-D)*1.4,0.,1.));
@@ -330,15 +340,16 @@ void main(){
   vec3 s=uWorldFromGal*aDir;
   vec3 head=aberrate(s,uHeading,uBeta);
   // The tail traces where aberration has carried the star from: a smear of its motion.
-  vec3 tail=aberrate(s,uHeading,max(0.,uBeta-.2*uStretch));
+  vec3 tail=aberrate(s,uHeading,max(0.,uBeta-uStretch*mix(.12,.19,smoothstep(.45,2.,aMag))));
   vec4 ch=projectionMatrix*vec4(mat3(viewMatrix)*head,1.);
   vec4 ct=projectionMatrix*vec4(mat3(viewMatrix)*tail,1.);
   if(ch.w<=0.){gl_Position=vec4(2.,2.,2.,1.);return;}
   if(ct.w<=0.)ct=ch;
-  float co=dot(head,uHeading);
+  float co=dot(s,uHeading);
   float D=inversesqrt(1.-uBeta*uBeta)*(1.+uBeta*co);
-  float width=uPx*(.7+.6*sqrt(aMag));
-  float len=length(ch.xy/ch.w-ct.xy/ct.w)*.5*uViewport.x;
+  vHalo=smoothstep(.4,2.,aMag);
+  float width=max(.85,uPx*(1.+1.7*vHalo));
+  float len=length((ch.xy/ch.w-ct.xy/ct.w)*.5*uViewport);
   vC=blackbody(aTemp*D)*aMag*min(D*D,2.)*uExposure*mix(1.,(2.*width)/(2.*width+len),.7);
   gl_Position=capsule(ch,ct,width,.99999);
 }`,

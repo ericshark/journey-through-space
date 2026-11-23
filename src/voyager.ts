@@ -16,6 +16,7 @@ import {
   Mesh,
   MeshStandardMaterial,
   SphereGeometry,
+  Texture,
   Vector2,
   Vector3,
 } from 'three';
@@ -191,4 +192,54 @@ export function voyagerExtent() {
           new Vector3(corners[x].x, corners[y].y, corners[z].z).length(),
         );
   return max;
+}
+
+/** NASA VTAD's textured model. Keep the reference geometry in its original proportions. */
+export async function loadVoyager() {
+  const { GLTFLoader } = await import('three/addons/loaders/GLTFLoader.js');
+  const { scene } = await new GLTFLoader().loadAsync('/models/voyager.glb');
+  // NASA's dish opens along +Y. The inspection scene expects +Z.
+  scene.rotation.set(Math.PI / 2, 0, Math.PI, 'ZYX');
+  const bounds = new Box3().setFromObject(scene);
+  const scale = 6.1 / bounds.getSize(new Vector3()).length();
+  scene.scale.setScalar(scale);
+  scene.position.copy(bounds.getCenter(new Vector3())).multiplyScalar(-scale);
+  scene.traverse((child) => {
+    if (
+      !(child instanceof Mesh) ||
+      !(child.material instanceof MeshStandardMaterial)
+    )
+      return;
+    const material = child.material;
+    // Use the baked surface colors for a little fill on the side facing away
+    // from the sun, so the bus and instruments stay readable in orbit.
+    material.metalness *= 0.7;
+    if (material.map && !material.transparent) {
+      material.emissiveMap = material.map;
+      material.emissive.setScalar(0.14);
+    }
+  });
+  return new Group().add(scene);
+}
+
+export function disposeVoyager(craft: Group) {
+  const materials = new Set<MeshStandardMaterial>();
+  craft.traverse((child) => {
+    if (!(child instanceof Mesh)) return;
+    child.geometry.dispose();
+    const meshMaterials = Array.isArray(child.material)
+      ? child.material
+      : [child.material];
+    for (const material of meshMaterials) materials.add(material);
+  });
+  const textures = new Set<Texture>();
+  for (const material of materials) {
+    for (const value of Object.values(material))
+      if (value instanceof Texture) textures.add(value);
+    material.dispose();
+  }
+  for (const texture of textures) {
+    if (texture.image instanceof ImageBitmap) texture.image.close();
+    texture.dispose();
+  }
 }

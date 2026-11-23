@@ -31,10 +31,32 @@ float vn(vec2 p){vec2 i=floor(p),f=fract(p);f=f*f*(3.-2.*f);
   return mix(mix(h21(i),h21(i+vec2(1,0)),f.x),mix(h21(i+vec2(0,1)),h21(i+vec2(1,1)),f.x),f.y);}
 float fbm(vec2 p){float a=.5,s=0.;for(int i=0;i<5;i++){s+=a*vn(p);p=p*2.03+17.1;a*=.5;}return s;}`;
 
+// Sample in body space so animated detail can cross longitudes and poles.
+const SPHERE_NOISE = `
+float hashCell(vec3 cell) {
+  cell = fract(cell * 0.1031);
+  cell += dot(cell, cell.yzx + 33.33);
+  return fract((cell.x + cell.y) * cell.z);
+}
+float bodyNoise(vec3 p) {
+  vec3 i = floor(p), f = fract(p);
+  f = f * f * (3.0 - 2.0 * f);
+  return mix(
+    mix(mix(hashCell(i), hashCell(i + vec3(1, 0, 0)), f.x),
+        mix(hashCell(i + vec3(0, 1, 0)), hashCell(i + vec3(1, 1, 0)), f.x), f.y),
+    mix(mix(hashCell(i + vec3(0, 0, 1)), hashCell(i + vec3(1, 0, 1)), f.x),
+        mix(hashCell(i + vec3(0, 1, 1)), hashCell(i + vec3(1, 1, 1)), f.x), f.y), f.z);
+}
+float filteredNoise(vec3 p) {
+  float footprint = max(length(dFdx(p)), length(dFdy(p)));
+  return mix(bodyNoise(p), 0.5, smoothstep(0.35, 1.2, footprint));
+}
+`;
+
 /** World-space normal, east tangent (+U) and position for UV spheres, scale-correct. */
-const VERT = `varying vec2 vUv;varying vec3 vN;varying vec3 vW;varying vec3 vT;
+const VERT = `varying vec3 vBody;varying vec2 vUv;varying vec3 vN;varying vec3 vW;varying vec3 vT;
 void main(){
-  vUv=uv;mat3 m=mat3(modelMatrix);
+  vUv=uv;vBody=normal;mat3 m=mat3(modelMatrix);
   vN=normalize(transpose(inverse(m))*normal);
   float phi=uv.x*6.2831853;vT=normalize(m*vec3(sin(phi),0.,cos(phi)));
   vec4 w=modelMatrix*vec4(position,1.);vW=w.xyz;
@@ -108,7 +130,8 @@ export function surfaceMaterial(look: WorldLook, t: SurfaceTextures) {
 uniform vec3 uAmbient;uniform float uRelief;uniform float uBandDrift;uniform float uDetail;uniform vec3 uHaze;
 uniform float uHazeStrength;uniform float time;
 varying vec2 vUv;varying vec3 vN;varying vec3 vW;varying vec3 vT;
-${NOISE}${FRAME}
+varying vec3 vBody;
+${SPHERE_NOISE}${FRAME}
 #ifdef RINGS
 ${RING_SHADOW}
 #endif
@@ -135,8 +158,11 @@ void main(){
   #endif
   #ifdef DETAIL
     float lat2=(vUv.y-.5)*3.14159;
-    float streak=fbm(vec2(uv.x*40.,uv.y*260.)+vec2(time*.002,0.));
-    albedo*=1.+uDetail*(streak-.5)*2.+uDetail*.6*sin(lat2*18.+fbm(uv*vec2(8.,30.))*3.);
+    vec3 p=normalize(vBody);
+    float angle=(uv.x-vUv.x)*6.2831853;
+    p.xz=mat2(cos(angle),-sin(angle),sin(angle),cos(angle))*p.xz;
+    float streak=filteredNoise(p*vec3(9.,70.,9.));
+    albedo*=1.+uDetail*(streak-.5)*2.+uDetail*.6*sin(lat2*18.+bodyNoise(p*vec3(2.,8.,2.))*3.);
   #endif
   float g=dot(N0,L),mu0=dot(N,L),mu=max(dot(N0,V),.0);
   float light;
@@ -328,17 +354,22 @@ export function sunMaterial(map: Texture, look: WorldLook) {
     vertexShader: VERT,
     fragmentShader: `uniform sampler2D map;uniform float time;uniform float uEmission;
 varying vec2 vUv;varying vec3 vN;varying vec3 vW;varying vec3 vT;
-${NOISE}
+varying vec3 vBody;
+${SPHERE_NOISE}
 void main(){
-  vec2 w=vec2(vn(vUv*vec2(24.,12.)+time*.05),vn(vUv*vec2(24.,12.)-time*.04+7.))-.5;
-  vec2 uv=vUv+w*.02+vec2(time*.0015,0.);
-  vec3 base=texture2D(map,uv).rgb;
-  float gran=vn(vUv*vec2(220.,110.)+time*.18)*.6+vn(vUv*vec2(520.,260.)-time*.25)*.4;
+  vec3 p=normalize(vBody);
+  vec3 drift=vec3(0.,time*.028,0.);
+  vec2 distortion=vec2(bodyNoise(p*8.+drift),bodyNoise(p*8.-drift+13.))-.5;
+  vec3 base=texture2D(map,vUv+distortion*.012).rgb;
+  float gran=filteredNoise(p*85.+drift)*.68+filteredNoise(p*175.-drift)*.32;
+  float activeRegion=smoothstep(.56,.77,bodyNoise(p*5.+5.));
+  float spots=activeRegion*smoothstep(.62,.79,bodyNoise(p*21.+19.));
   float mu=max(dot(normalize(vN),normalize(cameraPosition-vW)),0.);
-  // Solar limb darkening (Eddington-like law), reddening towards the edge.
-  float limb=.3+.7*pow(mu,.6);
-  vec3 c=base*(.78+.5*gran)*limb;
-  c=mix(c*vec3(1.,.62,.3),c,smoothstep(0.,.55,mu));
+  float limb=.38+.62*pow(mu,.55);
+  float luminance=dot(base,vec3(.2126,.7152,.0722));
+  vec3 c=mix(vec3(1.,.38,.12),vec3(1.,.87,.59),smoothstep(.05,.55,luminance));
+  c*= (.29+.64*sqrt(luminance))*(.72+.63*gran)*(1.-.77*spots)*limb;
+  c=mix(c*vec3(1.,.65,.36),c,smoothstep(0.,.72,mu));
   gl_FragColor=vec4(c*uEmission,1.);
   ${OUTPUT}
 }`,
@@ -355,19 +386,21 @@ export function proximaMaterial(look: WorldLook) {
     uniforms: { time: { value: 0 }, uEmission: { value: look.emission ?? 3 } },
     vertexShader: VERT,
     fragmentShader: `uniform float time;uniform float uEmission;varying vec2 vUv;varying vec3 vN;varying vec3 vW;varying vec3 vT;
-${NOISE}
+varying vec3 vBody;
+${SPHERE_NOISE}
 void main(){
-  vec2 q=vUv*vec2(10.,5.);
-  vec2 warp=vec2(fbm(q+time*.03),fbm(q-time*.025+9.))-.5;
-  float cells=fbm(q*3.+warp*2.4+vec2(time*.02,0.));
-  float fine=vn(vUv*vec2(260.,130.)+time*.2);
-  float spots=smoothstep(.62,.8,fbm(vUv*vec2(6.,3.)+vec2(3.1,time*.004)));
-  float flare=smoothstep(.72,.9,fbm(vUv*vec2(5.,2.5)+17.+time*.01));
-  vec3 deep=vec3(.42,.07,.03),mid=vec3(.95,.27,.1),hot=vec3(1.,.5,.22);
-  vec3 c=mix(deep,mid,smoothstep(.25,.7,cells));
-  c=mix(c,hot,smoothstep(.6,.95,cells)*.5+flare*.55);
-  c*=.88+.24*fine;
-  c*=1.-spots*.7;
+  vec3 p=normalize(vBody);
+  vec3 drift=vec3(.015,-.024,.012)*time;
+  float convection=bodyNoise(p*8.+drift);
+  float cells=filteredNoise(p*30.+convection*1.8-drift);
+  float fine=filteredNoise(p*130.+drift);
+  float spots=smoothstep(.56,.77,bodyNoise(p*4.7+3.1));
+  float activity=smoothstep(.66,.86,bodyNoise(p*13.+17.));
+  float activeFilaments=activity*smoothstep(.47,.75,cells);
+  vec3 deep=vec3(.36,.037,.013),mid=vec3(.88,.18,.049),hot=vec3(1.,.48,.19);
+  vec3 c=mix(deep,mid,smoothstep(.17,.83,cells*.65+convection*.35));
+  c=mix(c,hot,activeFilaments*.6);
+  c*=(.76+.45*fine)*(1.-spots*.67);
   float mu=max(dot(normalize(vN),normalize(cameraPosition-vW)),0.);
   c*=.18+.82*pow(mu,.8);
   c=mix(c,c*vec3(.85,.45,.35),1.-mu);
@@ -389,7 +422,7 @@ export function coronaMaterial(look: WorldLook, size: number) {
     uniforms: {
       uColor: { value: v3(look.corona ?? [1, 0.8, 0.5]) },
       uSize: { value: size },
-      uIntensity: { value: (look.emission ?? 4) * 0.3 },
+      uIntensity: { value: (look.emission ?? 4) * 0.19 },
       time: { value: 0 },
     },
     vertexShader: `uniform float uSize;varying vec2 vP;
@@ -400,11 +433,11 @@ ${NOISE}
 void main(){
   float r=length(vP);
   if(r<.98)discard;
-  float a=atan(vP.y,vP.x);
-  float streamers=.55+.9*fbm(vec2(a*3.2+sin(a)*.4,r*.35-time*.008));
-  streamers*=.75+.5*vn(vec2(a*14.,time*.02));
+  vec2 outward=vP/r;
+  float streamers=.35+1.2*fbm(outward*3.+r*.34-time*.008);
+  streamers*=.64+.72*vn(outward*14.+time*.02);
   float x=r-1.;
-  float glow=exp(-x*7.)*.9+exp(-x*1.7)*.32*streamers+exp(-x*.6)*.05;
+  float glow=exp(-x*20.)*.6+exp(-x*3.4)*.37*streamers+exp(-x*1.2)*.055;
   glow*=1.-smoothstep(uSize*.7,uSize,r);
   gl_FragColor=vec4(uColor*glow*uIntensity,1.);
   ${OUTPUT}

@@ -2,6 +2,13 @@
  * Texture requirements per stop. The renderer loads these through one shared
  * cache; this module is pure data so lifecycle rules can be tested directly.
  */
+import {
+  NoColorSpace,
+  RedFormat,
+  RepeatWrapping,
+  SRGBColorSpace,
+  type Texture,
+} from 'three';
 import { CHECKPOINTS } from './journey';
 
 export interface AssetSpec {
@@ -60,6 +67,18 @@ export const ASSETS: Record<string, AssetSpec> = {
   uranus: { name: 'uranus', ext: 'jpg', fallback: '#9fd4d8' },
   neptune: { name: 'neptune', ext: 'jpg', fallback: '#3f62c8' },
 };
+/** Equirectangular maps tile around longitude. The ring strip is radial. */
+export function configureTexture(
+  texture: Texture,
+  name: string,
+  anisotropy: number,
+) {
+  const spec = ASSETS[name];
+  texture.colorSpace = spec.linear ? NoColorSpace : SRGBColorSpace;
+  if (name !== 'saturn-rings') texture.wrapS = RepeatWrapping;
+  if (spec.single) texture.format = RedFormat;
+  texture.anisotropy = anisotropy;
+}
 const EXTRA: Record<string, string[]> = {
   earth: ['night', 'clouds', 'earth-normal', 'earth-specular'],
   moon: ['moon-normal'],

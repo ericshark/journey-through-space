@@ -65,12 +65,12 @@ const FLOW: StreakSpec = {
   depth: 260,
   size: 0.03,
   maxWidth: 2.2,
-  drift: 520,
+  drift: 620,
   colors: ['#dfe9ff', '#ffffff', '#ffe9cc', '#c9dcff'],
   seed: 97,
-  streak: 22,
+  streak: 24,
 };
-const FLOW_OPACITY = 0.38;
+const FLOW_OPACITY = 0.33;
 
 export interface LayerFrame {
   at: Vector3;

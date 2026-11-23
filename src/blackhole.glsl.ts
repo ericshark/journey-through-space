@@ -19,20 +19,13 @@ uniform float uTime;
 uniform vec3 uCamPos;
 uniform mat3 uCamBasis;
 uniform float uTanHalfFov;
-uniform sampler2D uTitle;
-uniform vec2 uTitleSize;
-uniform float uTitleOpacity;
-uniform vec3 uLensPos;
-uniform float uLensMass;
-uniform float uWhiteout;
-uniform float uInvert;
-uniform float uStepScale;
+uniform sampler2D uSky;
+uniform mat3 uGalFromLens;
 
 varying vec2 vUv;
 
 const float DISK_IN = 2.4;
 const float DISK_OUT = 11.0;
-const float TITLE_Z = -16.0;
 const float ESCAPE_R = 60.0;
 const int MAX_STEPS = 120;
 
@@ -81,33 +74,23 @@ vec3 diskRamp(float t) {
   return c;
 }
 
-vec3 starLayer(vec3 dir, float scale, float seed) {
-  vec3 p = dir * scale;
+vec3 stars(vec3 dir) {
+  vec3 p = dir * 135.0;
   vec3 cell = floor(p);
-  vec3 local = fract(p) - 0.5;
-  vec3 h = hash33(cell + seed);
-  if (h.y < 0.82) return vec3(0.0);
-  vec3 offset = (h - 0.5) * 0.6;
-  float d = length(local - offset);
-  float twinkle = 0.75 + 0.25 * sin(uTime * (1.0 + h.x * 3.0) + h.z * 40.0);
-  float core = smoothstep(0.09, 0.0, d) * pow(h.x, 6.0) * 4.0 * twinkle;
-  vec3 tint = mix(vec3(1.0, 0.78, 0.6), vec3(0.62, 0.78, 1.0), h.z);
-  return tint * core;
+  vec3 h = hash33(cell);
+  if (h.y < 0.89) return vec3(0.0);
+  float d = length(fract(p) - 0.5 - (h - 0.5) * 0.48);
+  float core = (1.0 - smoothstep(0.02, 0.22, d)) * pow(h.x, 8.0);
+  return mix(vec3(1.0, 0.83, 0.69), vec3(0.76, 0.87, 1.0), h.z) * core * 0.55;
 }
 
 vec3 sky(vec3 dir) {
-  vec3 col = vec3(0.0);
-  col += starLayer(dir, 90.0, 1.0);
-  col += starLayer(dir, 170.0, 7.0) * 0.7;
-  col += starLayer(dir, 320.0, 19.0) * 0.45;
-
-  float n = fbm(dir * 2.6 + vec3(0.0, 0.0, uTime * 0.004));
-  float wisps = fbm(dir * 7.0 - n * 1.5);
-  float band = exp(-pow(dir.y * 2.4 - 0.35 * sin(dir.x * 2.0), 2.0));
-  vec3 nebula = mix(vec3(0.05, 0.02, 0.10), vec3(0.02, 0.08, 0.13), n);
-  nebula += vec3(0.20, 0.06, 0.12) * pow(wisps, 3.0) * band;
-  col += nebula * (0.35 + 0.65 * band) * 0.55;
-  return col;
+  vec3 g = uGalFromLens * dir;
+  vec2 uv = vec2(0.5 - atan(g.y, g.x) / 6.2831853,
+                 0.5 + asin(clamp(g.z, -1.0, 1.0)) / 3.14159265);
+  // Fixed detail level avoids ringing where adjacent lensed rays diverge.
+  vec3 dust = textureLod(uSky, uv, 1.5).rgb;
+  return dust * vec3(0.37, 0.29, 0.23) + stars(g);
 }
 
 // Emission and opacity where a ray pierces the disk plane at p.
@@ -119,12 +102,13 @@ vec4 diskSample(vec3 p, vec3 rayDir) {
   float omega = 1.6 / pow(r, 1.5);
   float a = angle + uTime * omega;
   vec2 q = vec2(cos(a), sin(a)) * r;
-  float turbulence = fbm(vec3(q * 1.1, r * 0.35));
-  float streaks = fbm(vec3(q * 3.2, r * 2.0 + turbulence));
-  float lanes = 0.72 + 0.28 * sin(r * (5.0 + 3.0 * turbulence) + turbulence * 6.0);
+  float turbulence = fbm(vec3(q * 0.92, r * 0.3));
+  float streaks = fbm(vec3(q * 1.75, r * 10.5 + turbulence * 3.7));
+  float strands = fbm(vec3(q * 3.2, r * 24.0 + streaks * 3.0));
+  float lanes = mix(0.5, 1.0, smoothstep(0.19, 0.8, streaks * 0.74 + strands * 0.26));
 
-  float density = smoothstep(DISK_IN, DISK_IN + 0.5, r) * smoothstep(DISK_OUT, DISK_OUT - 5.5, r);
-  density *= (0.25 + 0.75 * turbulence) * (0.45 + 0.55 * lanes) * (0.6 + 0.6 * streaks);
+  float density = smoothstep(DISK_IN, DISK_IN + 0.5, r) * (1.0 - smoothstep(DISK_OUT - 5.5, DISK_OUT, r));
+  density *= (0.39 + 0.61 * turbulence) * lanes;
 
   // Keplerian orbital velocity and relativistic Doppler factor toward the camera.
   vec3 velDir = normalize(vec3(-p.z, 0.0, p.x));
@@ -135,12 +119,18 @@ vec4 diskSample(vec3 p, vec3 rayDir) {
 
   float heat = pow(DISK_IN / r, 0.85);
   vec3 col = diskRamp(heat * pow(shift, 1.6) * (0.85 + 0.3 * streaks));
-  float intensity = density * pow(heat, 1.15) * pow(shift, 3.0) * 5.0;
+  float intensity = density * pow(heat, 1.15) * pow(shift, 3.0) * 4.4;
   return vec4(col * intensity, clamp(density * 1.05, 0.0, 0.94));
 }
 
 vec3 aces(vec3 x) {
   return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+}
+
+vec3 acceleration(vec3 p, float h2) {
+  float invR = inversesqrt(max(dot(p, p), 0.25));
+  float invR2 = invR * invR;
+  return -1.5 * h2 * p * invR * invR2 * invR2;
 }
 
 void main() {
@@ -159,29 +149,23 @@ void main() {
   float glow = 0.0;
   float ringGlow = 0.0;
   bool captured = false;
-  // Blue noise would be nicer, but a hashed start offset hides the step banding.
-  float jitter = hash13(vec3(gl_FragCoord.xy, fract(uTime) * 61.0));
+  vec3 acc = acceleration(pos, h2);
 
   for (int i = 0; i < MAX_STEPS; i++) {
     float r = length(pos);
-    float dt = clamp(0.085 * r, 0.02, max(1.4, r * 0.08)) * uStepScale;
-    if (i == 0) dt *= jitter;
+    float dt = clamp(0.078 * r, 0.027, max(1.2, r * 0.078));
 
-    // Exact null-geodesic bending in Cartesian form: a = -1.5 h^2 x / r^5.
-    vec3 acc = -1.5 * h2 * pos / pow(r, 5.0);
-    vec3 lp = pos - uLensPos;
-    float lr2 = dot(lp, lp) + 0.04;
-    acc -= uLensMass * lp / (lr2 * sqrt(lr2));
-
+    // Leapfrog integration keeps the lens stable without pixel or time jitter.
     vec3 prev = pos;
-    vel += acc * dt;
+    vel += acc * (0.5 * dt);
     pos += vel * dt;
     float rNew = length(pos);
-
     if (rNew < 1.0) {
       captured = true;
       break;
     }
+    acc = acceleration(pos, h2);
+    vel += acc * (0.5 * dt);
 
     if (prev.y * pos.y < 0.0) {
       vec3 hit = mix(prev, pos, prev.y / (prev.y - pos.y));
@@ -191,9 +175,9 @@ void main() {
     }
 
     // Thin volumetric haze hugging the disk, plus the photon ring's halo.
-    float diskBand = smoothstep(DISK_IN - 0.4, DISK_IN + 1.0, rNew) * smoothstep(DISK_OUT + 2.0, DISK_IN + 2.0, rNew);
+    float diskBand = smoothstep(DISK_IN - 0.4, DISK_IN + 1.0, rNew) * (1.0 - smoothstep(DISK_IN + 2.0, DISK_OUT + 2.0, rNew));
     glow += exp(-abs(pos.y) * 5.0) * diskBand * dt * 0.018 / max(rNew - 1.0, 0.3);
-    ringGlow += exp(-pow((rNew - 1.5) * 7.0, 2.0)) * dt * 0.05;
+    ringGlow += exp(-pow((rNew - 1.5) * 7.0, 2.0)) * dt * 0.027;
 
     if (trans < 0.01) break;
     if (rNew > ESCAPE_R && dot(pos, vel) > 0.0) break;
@@ -202,14 +186,10 @@ void main() {
   if (!captured) col += trans * sky(normalize(vel)) + ringGlow * vec3(1.0, 0.7, 0.42);
   col += glow * vec3(1.0, 0.45, 0.16);
 
-  col = aces(col * 1.1);
-  col = pow(col, vec3(0.92));
+  col = aces(col * 1.25);
 
   vec2 vig = vUv - 0.5;
-  col *= 1.0 - dot(vig, vig) * 0.9;
-
-
-
+  col *= 1.0 - dot(vig, vig) * 0.62;
 
   gl_FragColor = vec4(col * (1.0 - uDarkness), uOpacity);
 }
