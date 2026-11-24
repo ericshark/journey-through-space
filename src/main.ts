@@ -8,7 +8,6 @@ import {
 } from './controller';
 import { RollingDigits, earthDistance } from './instruments';
 import { inspectionInput } from './inspection-input';
-import { gsap } from 'gsap';
 import {
   CHECKPOINTS,
   TOTAL,
@@ -39,12 +38,12 @@ import {
   detailFacts,
   type UnitMode,
 } from './units';
-import { JourneyRenderer } from './renderer';
+import type { JourneyRenderer } from './renderer';
 import { AudioEngine } from './audio';
 const $ = <T extends HTMLElement = HTMLElement>(s: string) =>
   document.querySelector<T>(s)!;
-const renderer = JourneyRenderer.create($<HTMLCanvasElement>('#universe'));
-document.documentElement.classList.add(renderer ? 'has-webgl' : 'no-webgl');
+let renderer: JourneyRenderer | null | undefined;
+let disposed = false;
 const audio = new AudioEngine(),
   controller = new JourneyController(),
   wheel = new WheelIntent();
@@ -347,7 +346,10 @@ function updateUI() {
     : 'full';
   document.documentElement.dataset.motionMode = s.motionMode;
   document.documentElement.classList.toggle('has-webgl', webgl);
-  document.documentElement.classList.toggle('no-webgl', !webgl);
+  document.documentElement.classList.toggle(
+    'no-webgl',
+    renderer !== undefined && !webgl,
+  );
   document.documentElement.style.setProperty('--accent', p.color);
   document.documentElement.style.setProperty('--fallback-color', p.color);
   for (const el of [
@@ -449,11 +451,11 @@ function updateUI() {
   $('#context-actions').hidden = !lost;
   $('#render-status').textContent = lost
     ? 'Graphics context lost · Journey paused. Restore 3D view or continue with static illustration.'
-    : !renderer || renderer.fallbackPinned
+    : renderer === null || renderer?.fallbackPinned
       ? 'Static illustration · 3D inspection unavailable.'
-      : renderer.textureFailures
+      : renderer?.textureFailures
         ? 'Some imagery unavailable · illustrated surfaces remain active.'
-        : renderer.pendingTextures
+        : renderer?.pendingTextures
           ? 'Loading planetary imagery…'
           : '';
 }
@@ -539,7 +541,9 @@ function handlePlaybackTransition(
   }
 }
 let lastPhase = '';
+let frameId: number;
 function frame() {
+  frameId = requestAnimationFrame(frame);
   const now = performance.now(),
     dt = Math.min((now - last) / 1000, 0.05);
   last = now;
@@ -564,8 +568,6 @@ function frame() {
     updateRouteTraveler(state);
   }
 }
-gsap.ticker.add(frame);
-gsap.ticker.lagSmoothing(0);
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) controller.pause(performance.now());
   visible = !document.hidden;
@@ -588,7 +590,8 @@ window.addEventListener('resize', () => {
 window.addEventListener('pagehide', (event) => {
   // A persisted page may be restored from the back/forward cache; keep it alive.
   if (event.persisted) return;
-  gsap.ticker.remove(frame);
+  disposed = true;
+  cancelAnimationFrame(frameId);
   audio.dispose();
   renderer?.dispose();
 });
@@ -630,9 +633,18 @@ window.__horizon = {
   setQuality: (scale: number) => renderer?.setQuality(scale),
 };
 
-if (renderer) {
-  renderer.onStatusChange = () => updateUI();
-  renderer.onContextLost = () => {
+async function initializeRenderer() {
+  const module = await import('./renderer').catch(() => null);
+  if (disposed) return;
+  const graphics =
+    module?.JourneyRenderer.create($<HTMLCanvasElement>('#universe')) ?? null;
+  renderer = graphics;
+  if (!graphics) {
+    updateUI();
+    return;
+  }
+  graphics.onStatusChange = () => updateUI();
+  graphics.onContextLost = () => {
     controller.pause(performance.now());
     clearInspection();
     wheel.reset();
@@ -641,12 +653,14 @@ if (renderer) {
     $('#journey-announcement').textContent =
       'Graphics context lost. Journey paused. Restore 3D view or continue with static illustration.';
   };
-  renderer.onContextRestored = () => {
+  graphics.onContextRestored = () => {
     state = controller.snapshot();
     updateUI();
-    renderer.render(state, time);
+    graphics.render(state, time);
     $('#journey-announcement').textContent = '3D view restored.';
   };
+  graphics.render(state, time);
+  updateUI();
 }
 $('#restore-webgl').addEventListener('click', () => {
   renderer?.restoreContext();
@@ -831,3 +845,6 @@ document.addEventListener(
   },
   { passive: false, capture: true },
 );
+
+frameId = requestAnimationFrame(frame);
+void initializeRenderer();

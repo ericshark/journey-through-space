@@ -101,7 +101,9 @@ export class JourneyRenderer {
   private busyTicks = 0;
   private drawnKey = '';
   private pendingAssets = new Set<string>();
+  private failedAssets = new Set<string>();
   private timers = new Map<string, ReturnType<typeof setTimeout>>();
+  private deferEarthNeighbors = true;
   private scene = new Scene();
   private horizonScene = new Scene();
   private horizonTarget = new WebGLRenderTarget(1, 1, { depthBuffer: false });
@@ -195,8 +197,9 @@ export class JourneyRenderer {
   private loader = new TextureLoader();
   private field?: Points;
   frames = 0;
-  textureFailures = 0;
-  timedOutTextures = 0;
+  get textureFailures() {
+    return this.failedAssets.size;
+  }
   contextLost = false;
   fallbackPinned = false;
   onStatusChange?: () => void;
@@ -290,30 +293,31 @@ export class JourneyRenderer {
       return null;
     }
   }
+  private syncTextureStatus() {
+    this.pendingTextures = this.pendingAssets.size;
+    if (this.pendingTextures === 0 && this.nodes.size > 0)
+      document.documentElement.dataset.textures = 'ready';
+    if (this.failedAssets.size > 0)
+      document.documentElement.dataset.textureFallback = 'true';
+    else delete document.documentElement.dataset.textureFallback;
+  }
   private loadTexture(name: string) {
     if (assets.has(name)) return assets.get(name)!;
     const spec = ASSETS[name];
     this.pendingAssets.add(name);
     this.pendingTextures = this.pendingAssets.size;
     document.documentElement.dataset.textures = 'loading';
-    let settled = false;
-    const clearTimer = () => {
+    const finishLoading = () => {
       const timer = this.timers.get(name);
       if (timer !== undefined) clearTimeout(timer);
       this.timers.delete(name);
-    };
-    const applyFallback = (timedOut = false) => {
-      if (settled) return;
-      settled = true;
-      clearTimer();
       this.pendingAssets.delete(name);
-      this.pendingTextures = this.pendingAssets.size;
-      // Reserved for load failures or 10 s timeout: a flat placeholder keeps the scene alive.
-      this.textureFailures++;
-      if (timedOut) this.timedOutTextures++;
-      document.documentElement.dataset.textureFallback = 'true';
-      if (this.pendingTextures === 0 && this.nodes.size > 0)
-        document.documentElement.dataset.textures = 'ready';
+      this.syncTextureStatus();
+      this.drawnKey = '';
+      this.onStatusChange?.();
+    };
+    const applyFallback = () => {
+      if (assets.get(name) !== texture || !this.pendingAssets.has(name)) return;
       const fallback = document.createElement('canvas');
       fallback.width = 4;
       fallback.height = 2;
@@ -322,29 +326,21 @@ export class JourneyRenderer {
       ctx.fillRect(0, 0, 4, 2);
       (texture.source as { data: unknown }).data = fallback;
       texture.needsUpdate = true;
-      this.drawnKey = '';
-      this.onStatusChange?.();
+      this.failedAssets.add(name);
+      finishLoading();
     };
     const texture = this.loader.load(
       `/textures/${name}.${spec.ext}`,
       () => {
-        if (settled) return;
-        settled = true;
-        clearTimer();
-        this.pendingAssets.delete(name);
-        this.pendingTextures = this.pendingAssets.size;
-        if (this.pendingTextures === 0 && this.nodes.size > 0)
-          document.documentElement.dataset.textures = 'ready';
-        this.drawnKey = '';
-        this.onStatusChange?.();
+        if (assets.get(name) !== texture) return;
+        // A slow transfer can still replace the timeout illustration.
+        this.failedAssets.delete(name);
+        finishLoading();
       },
       undefined,
-      () => applyFallback(false),
+      applyFallback,
     );
-    this.timers.set(
-      name,
-      setTimeout(() => applyFallback(true), LOAD_TIMEOUT_MS),
-    );
+    this.timers.set(name, setTimeout(applyFallback, LOAD_TIMEOUT_MS));
     configureTexture(
       texture,
       name,
@@ -446,12 +442,11 @@ export class JourneyRenderer {
         if (timer !== undefined) clearTimeout(timer);
         this.timers.delete(name);
         this.pendingAssets.delete(name);
+        this.failedAssets.delete(name);
         texture.dispose();
         assets.delete(name);
       }
-    this.pendingTextures = this.pendingAssets.size;
-    if (this.pendingTextures === 0)
-      document.documentElement.dataset.textures = 'ready';
+    this.syncTextureStatus();
   }
   loseContext() {
     this.fallbackPinned = false;
@@ -746,7 +741,18 @@ export class JourneyRenderer {
     const warp = warpAt(s.cameraPose ? thrust : 0, reduced);
     const originZ = s.now * SPACING;
     const leg = Math.min(CHECKPOINTS.length - 1, Math.floor(s.position));
-    const resident = [...residentStops(leg)];
+    // Moon and Mercury are behind the camera in the opening Earth view.
+    // Build the usual neighborhood as soon as inspection or travel can reveal it.
+    if (
+      s.now !== 0 ||
+      (s.playback && s.playback !== 'observing') ||
+      s.dragging ||
+      s.cameraX !== 0 ||
+      s.cameraZ <= 0 ||
+      (s.cameraPose && s.cameraPose.position[1] !== 0)
+    )
+      this.deferEarthNeighbors = false;
+    const resident = this.deferEarthNeighbors ? [0] : residentStops(leg);
     if (
       s.playback &&
       s.playback !== 'observing' &&
